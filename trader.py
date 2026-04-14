@@ -177,6 +177,9 @@ class Trader:
 
     def __init__(self) -> None:
         self.strategy = Round1Trader()
+        self.anchor_mid: Dict[str, float] = {}
+        self.anchor_timestamp: Dict[str, int] = {}
+        self.last_timestamp: int = -1
 
     @staticmethod
     def _best_bid(order_depth: Any) -> Tuple[Optional[int], int]:
@@ -192,6 +195,135 @@ class Trader:
         price = min(order_depth.sell_orders)
         volume = -int(order_depth.sell_orders[price])
         return price, volume
+
+    @staticmethod
+    def _sorted_asks(order_depth: Any) -> List[Tuple[int, int]]:
+        return [(int(price), -int(volume)) for price, volume in sorted(order_depth.sell_orders.items())]
+
+    @staticmethod
+    def _sorted_bids(order_depth: Any) -> List[Tuple[int, int]]:
+        return [(int(price), int(volume)) for price, volume in sorted(order_depth.buy_orders.items(), reverse=True)]
+
+    @staticmethod
+    def _clamp(value: int, lo: int, hi: int) -> int:
+        return max(lo, min(hi, value))
+
+    def _new_session(self, timestamp: int) -> bool:
+        return self.last_timestamp != -1 and timestamp < self.last_timestamp
+
+    def _anchor_for_product(self, product: str, timestamp: int, mid_price: float) -> None:
+        if product not in self.anchor_mid or timestamp == 0 or self._new_session(timestamp):
+            self.anchor_mid[product] = mid_price
+            self.anchor_timestamp[product] = timestamp
+
+    def _ash_orders(
+        self,
+        product: str,
+        order_depth: Any,
+        best_bid: int,
+        best_ask: int,
+        bid_volume: int,
+        ask_volume: int,
+        mid_price: float,
+        position: int,
+    ) -> List[Any]:
+        cfg = self.strategy.configs[product]
+        imbalance = 0.0
+        if bid_volume + ask_volume > 0:
+            imbalance = (bid_volume - ask_volume) / (bid_volume + ask_volume)
+
+        fair = cfg.anchor_price + 2.0 * imbalance - 0.20 * position
+        limit = cfg.position_limit
+        orders: List[Any] = []
+
+        current_position = position
+        for ask_price, ask_size in self._sorted_asks(order_depth):
+            if ask_price <= fair - 2 and current_position < limit:
+                buy_qty = min(ask_size, limit - current_position, 10)
+                if buy_qty > 0:
+                    orders.append(ExchangeOrder(product, ask_price, buy_qty))
+                    current_position += buy_qty
+
+        for bid_price, bid_size in self._sorted_bids(order_depth):
+            if bid_price >= fair + 2 and current_position > -limit:
+                sell_qty = min(bid_size, limit + current_position, 10)
+                if sell_qty > 0:
+                    orders.append(ExchangeOrder(product, bid_price, -sell_qty))
+                    current_position -= sell_qty
+
+        bid_quote = min(best_bid + 1, int(fair - 1))
+        ask_quote = max(best_ask - 1, int(fair + 1))
+
+        if bid_quote < best_ask and current_position < limit:
+            buy_qty = min(6, limit - current_position)
+            if buy_qty > 0:
+                orders.append(ExchangeOrder(product, bid_quote, buy_qty))
+
+        if ask_quote > best_bid and current_position > -limit:
+            sell_qty = min(6, limit + current_position)
+            if sell_qty > 0:
+                orders.append(ExchangeOrder(product, ask_quote, -sell_qty))
+
+        return orders
+
+    def _ipr_orders(
+        self,
+        product: str,
+        order_depth: Any,
+        best_bid: int,
+        best_ask: int,
+        bid_volume: int,
+        ask_volume: int,
+        mid_price: float,
+        position: int,
+        timestamp: int,
+    ) -> List[Any]:
+        limit = self.strategy.configs[product].position_limit
+        self._anchor_for_product(product, timestamp, mid_price)
+
+        elapsed = timestamp - self.anchor_timestamp[product]
+        trend_fair = self.anchor_mid[product] + 0.001 * elapsed
+        imbalance = 0.0
+        if bid_volume + ask_volume > 0:
+            imbalance = (bid_volume - ask_volume) / (bid_volume + ask_volume)
+        trend_fair += 1.5 * imbalance - 0.05 * position
+
+        orders: List[Any] = []
+        current_position = position
+
+        # Strong long bias: the product has shown a consistent upward drift in both
+        # visible history and live submission logs, so we keep a core long inventory.
+        target_position = limit
+
+        for ask_price, ask_size in self._sorted_asks(order_depth):
+            if current_position >= target_position:
+                break
+            if ask_price <= trend_fair + 8:
+                buy_qty = min(ask_size, target_position - current_position, 12)
+                if buy_qty > 0:
+                    orders.append(ExchangeOrder(product, ask_price, buy_qty))
+                    current_position += buy_qty
+
+        # Replenish with a passive bid if we are not yet at the long target.
+        if current_position < target_position:
+            bid_quote = min(best_ask - 1, best_bid + 1)
+            if bid_quote > best_bid and bid_quote < best_ask:
+                buy_qty = min(8, target_position - current_position)
+                if buy_qty > 0:
+                    orders.append(ExchangeOrder(product, bid_quote, buy_qty))
+
+        # Only trim on strong overextensions so we do not keep fading the trend.
+        trim_threshold = trend_fair + 14
+        for bid_price, bid_size in self._sorted_bids(order_depth):
+            if current_position <= 10:
+                break
+            if bid_price >= trim_threshold:
+                sell_qty = min(bid_size, current_position - 10, 8)
+                if sell_qty > 0:
+                    orders.append(ExchangeOrder(product, bid_price, -sell_qty))
+                    current_position -= sell_qty
+
+        return orders
 
     def run(self, state: TradingState) -> Tuple[Dict[str, List[Any]], int, str]:
         result: Dict[str, List[Any]] = {}
@@ -216,18 +348,41 @@ class Trader:
             )
 
             self.strategy.position[product] = state.position.get(product, 0)
-            sim_orders = self.strategy.generate_orders(snapshot)
-            exchange_orders: List[Any] = []
-
-            for order in sim_orders:
-                if ExchangeOrder is None:
-                    exchange_orders.append(order)
+            if ExchangeOrder is None:
+                sim_orders = self.strategy.generate_orders(snapshot)
+                result[product] = [
+                    SimOrder(order.product, int(order.price), int(order.quantity)) for order in sim_orders
+                ]
+            else:
+                if product == "ASH_COATED_OSMIUM":
+                    result[product] = self._ash_orders(
+                        product,
+                        order_depth,
+                        bid_price,
+                        ask_price,
+                        bid_volume,
+                        ask_volume,
+                        mid_price,
+                        state.position.get(product, 0),
+                    )
+                elif product == "INTARIAN_PEPPER_ROOT":
+                    result[product] = self._ipr_orders(
+                        product,
+                        order_depth,
+                        bid_price,
+                        ask_price,
+                        bid_volume,
+                        ask_volume,
+                        mid_price,
+                        state.position.get(product, 0),
+                        state.timestamp,
+                    )
                 else:
-                    exchange_orders.append(ExchangeOrder(order.product, int(order.price), int(order.quantity)))
+                    result[product] = []
 
-            result[product] = exchange_orders
             self.strategy.on_snapshot_end(snapshot)
 
         conversions = 0
         trader_data = ""
+        self.last_timestamp = state.timestamp
         return result, conversions, trader_data
